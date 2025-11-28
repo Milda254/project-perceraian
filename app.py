@@ -30,8 +30,10 @@ def load_data():
 
 @st.cache_resource
 def load_artifacts():
+    # load preprocessor scikit-learn
     preprocessor = joblib.load(MODELS_DIR / "preprocessor.joblib")
-    model = load_model(MODELS_DIR / "model_perceraian.h5")
+    # compile=False supaya Keras tidak mencoba load loss/metric 'mse'
+    model = load_model(MODELS_DIR / "model_perceraian.h5", compile=False)
     return preprocessor, model
 
 
