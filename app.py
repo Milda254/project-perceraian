@@ -4,9 +4,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
-import joblib
 from tensorflow.keras.models import load_model
 import plotly.express as px
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 # ====== KONFIGURASI PATH ======
 BASE_DIR = Path(__file__).parent
@@ -29,11 +30,33 @@ def load_data():
 
 
 @st.cache_resource
-def load_artifacts():
-    # load preprocessor scikit-learn
-    preprocessor = joblib.load(MODELS_DIR / "preprocessor.joblib")
-    # compile=False supaya Keras tidak mencoba load loss/metric 'mse'
-    model = load_model(MODELS_DIR / "model_perceraian.h5", compile=False)
+def load_artifacts(df: pd.DataFrame):
+    """
+    Bangun ulang preprocessor langsung dari dataframe dan load model Keras.
+    Tidak lagi menggunakan preprocessor.joblib.
+    """
+    # Tentukan kolom fitur sama seperti saat training
+    all_cols = df.columns.tolist()
+    feature_cols_local = [c for c in all_cols if c != TARGET_COL]
+
+    categorical_cols_local = [REGION_COL]  # Kabupaten/Kota sebagai kategori
+    numeric_cols_local = [c for c in feature_cols_local if c not in categorical_cols_local]
+
+    # Preprocessor: OneHot untuk kategori, StandardScaler untuk numerik
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_cols_local),
+            ("num", StandardScaler(), numeric_cols_local),
+        ]
+    )
+
+    # Fit preprocessor pada seluruh data fitur
+    preprocessor.fit(df[feature_cols_local])
+
+    # Load model Keras untuk inference saja (tanpa compile)
+    model_path = MODELS_DIR / "model_perceraian.h5"
+    model = load_model(model_path, compile=False)
+
     return preprocessor, model
 
 
@@ -54,7 +77,7 @@ st.title("📊 Prediksi Perceraian Provinsi Jawa Barat")
 st.caption("Prediksi jumlah perceraian per kabupaten/kota di Provinsi Jawa Barat")
 
 df = load_data()
-preprocessor, model = load_artifacts()
+preprocessor, model = load_artifacts(df)
 
 # ====== DEFINISI KOLOM & FAKTOR ======
 all_cols = df.columns.tolist()
@@ -128,9 +151,27 @@ with tab1:
         st.markdown("#### 🧩 Faktor-faktor Tertinggi")
 
         if factor_cols:
+            df_year = df[df[YEAR_COL] == selected_year].copy()
+
             factor_sum = df_year[factor_cols].sum().sort_values(ascending=False)
             factor_df = factor_sum.reset_index()
             factor_df.columns = ["Faktor", "Nilai"]
+
+            # 1) Hilangkan prefix "Fakor Perceraian - " dari semua nama
+            factor_df["Faktor"] = (
+                factor_df["Faktor"]
+                .astype(str)
+                .str.replace("Fakor Perceraian - ", "", regex=False)
+                .str.strip()
+            )
+
+            # 2) Beberapa nama kita singkat lagi
+            short_map = {
+                "Perselisihan dan Pertengkaran Terus Menerus": "Perselisihan / Pertengkaran",
+                "Kekerasan Dalam Rumah Tangga": "KDRT",
+            }
+
+            factor_df["Faktor"] = factor_df["Faktor"].replace(short_map)
 
             fig_factor = px.bar(
                 factor_df,
@@ -152,6 +193,8 @@ with tab1:
             st.warning("Tidak ada kolom faktor yang terdeteksi di dataset.")
 
 
+
+
 # ====== TAB 2: PETA JAWA BARAT ======
 with tab2:
     st.subheader(f"🗺️ Peta Persebaran Perceraian Jawa Barat – {selected_year}")
@@ -166,7 +209,7 @@ with tab2:
             df_year,
             geojson=geojson,
             locations=REGION_COL,
-            featureidkey="properties.NAMA_KAB",  # GANTI sesuai nama field di geojson kamu
+            featureidkey="properties.NAME_2",  # <- ini yang benar untuk GeoJSON kamu
             color=TARGET_COL,
             color_continuous_scale="Reds",
             hover_name=REGION_COL,
@@ -190,7 +233,7 @@ with tab2:
     except FileNotFoundError:
         st.error(
             "File GeoJSON untuk peta belum ditemukan.\n\n"
-            "Tambahkan file `jawa_barat_kabkota.geojson` ke folder `data/` "
+            "Tambahkan file `Kabupaten-Kota (Provinsi Jawa Barat).geojson` ke folder `data/` "
             "dan sesuaikan nama field di `featureidkey`."
         )
 
@@ -200,74 +243,125 @@ with tab3:
     st.subheader("🤖 Prediksi Jumlah Perceraian")
 
     st.markdown(
-        "Pilih kabupaten/kota, tahun, dan nilai faktor untuk melihat prediksi jumlah perceraian "
-        "berdasarkan model deep learning yang sudah kamu latih."
+        "Pilih **kabupaten/kota**, **tahun prediksi**, dan **alasan perceraian** "
+        "yang ingin dianalisis. Model akan membuat prediksi untuk semua kombinasi "
+        "kabupaten × tahun yang kamu pilih."
     )
 
-    col_left, col_right = st.columns([1.4, 1])
+    # --- Siapkan label cantik untuk faktor (alasan perceraian) ---
+    def pretty_factor_name(col: str) -> str:
+        name = col.replace("Fakor Perceraian - ", "").strip()
+        if name == "Perselisihan dan Pertengkaran Terus Menerus":
+            name = "Perselisihan / Pertengkaran"
+        elif name == "Kekerasan Dalam Rumah Tangga":
+            name = "KDRT"
+        return name
 
-    with col_left:
-        st.markdown("##### Input Kondisi yang Ingin Diprediksi")
+    factor_display_map = {col: pretty_factor_name(col) for col in factor_cols}
+    display_to_col = {v: k for k, v in factor_display_map.items()}
 
-        region_input = st.selectbox(
-            "Pilih Kabupaten/Kota",
-            options=regions,
-        )
+    factor_options_display = [factor_display_map[c] for c in factor_cols]
 
-        default_year = int(df[YEAR_COL].max()) + 1
-        year_input = st.number_input(
-            "Pilih Tahun Prediksi",
-            min_value=int(df[YEAR_COL].min()),
-            max_value=2100,
-            value=default_year,
-            step=1,
-        )
+    # Gunakan form supaya semua input dikumpulkan dulu
+    with st.form("prediction_form"):
+        col_left, col_right = st.columns([1.4, 1])
 
-        st.markdown("###### Nilai Faktor-faktor Perceraian")
-        st.caption("Default slider di-set ke **median** dari dataset.")
+        with col_left:
+            st.markdown("##### Input Kondisi yang Ingin Diprediksi")
 
-        factor_values = {}
-        for col in factor_cols:
-            col_min = float(df[col].min())
-            col_max = float(df[col].max())
-            col_med = float(df[col].median())
-
-            factor_values[col] = st.slider(
-                col,
-                min_value=col_min,
-                max_value=col_max,
-                value=col_med,
+            # Bisa pilih lebih dari satu kabupaten/kota
+            regions_input = st.multiselect(
+                "Pilih Kabupaten/Kota",
+                options=regions,
+                default=[regions[0]] if len(regions) > 0 else [],
             )
 
-        pred_button = st.button("🔮 Prediksi Jumlah Perceraian")
+            # Bisa pilih lebih dari satu tahun
+            min_year = int(df[YEAR_COL].min())
+            default_year = int(df[YEAR_COL].max()) + 1
 
-    with col_right:
-        st.markdown("##### Hasil Prediksi")
+            years_input = st.multiselect(
+                "Pilih Tahun Prediksi",
+                options=list(range(min_year, 2101)),
+                default=[default_year],
+            )
 
-        if pred_button:
-            # susun input sesuai feature_cols
-            input_dict = {REGION_COL: region_input, YEAR_COL: year_input}
-            input_dict.update(factor_values)
+            st.markdown("###### Alasan Perceraian")
+            st.caption(
+                "Pilih satu atau beberapa alasan perceraian. "
+                "Alasan yang dipilih akan dianggap **aktif** dengan intensitas tipikal, "
+                "sedangkan yang tidak dipilih dianggap **tidak terjadi (0)**."
+            )
 
-            input_df = pd.DataFrame([input_dict])[feature_cols]
+            selected_factor_labels = st.multiselect(
+                "Pilih Alasan Perceraian (bisa lebih dari satu)",
+                options=factor_options_display,
+            )
 
+        with col_right:
+            st.markdown("##### Hasil Prediksi")
+            st.caption(
+                "Klik tombol di bawah untuk menghitung prediksi "
+                "berdasarkan input di sebelah kiri."
+            )
+            submit = st.form_submit_button("🔮 Prediksi Jumlah Perceraian")
+
+    # === LOGIKA SETELAH FORM SUBMIT ===
+    if submit:
+        if not regions_input or not years_input:
+            st.warning(
+                "Pilih **minimal satu** kabupaten/kota dan **minimal satu** tahun terlebih dahulu."
+            )
+        else:
+            # Ubah label alasan → nama kolom asli
+            selected_factor_cols = [display_to_col[lbl] for lbl in selected_factor_labels]
+
+            # Susun baris untuk semua kombinasi kabupaten × tahun
+            rows = []
+            for region in regions_input:
+                for year in years_input:
+                    row = {REGION_COL: region, YEAR_COL: year}
+
+                    # Bangun nilai faktor:
+                    # - jika dipilih → median dataset
+                    # - jika tidak dipilih → 0
+                    for col in factor_cols:
+                        if col in selected_factor_cols:
+                            value = float(df[col].median())
+                        else:
+                            value = 0.0
+                        row[col] = value
+
+                    rows.append(row)
+
+            input_df = pd.DataFrame(rows)[feature_cols]
+
+            # Transform dengan preprocessor
             X_p = preprocessor.transform(input_df)
             if hasattr(X_p, "toarray"):
                 X_p = X_p.toarray()
 
-            y_pred = model.predict(X_p)
-            y_pred_value = float(y_pred.flatten()[0])
+            # Prediksi
+            y_pred = model.predict(X_p).flatten()
 
-            st.metric(
-                "Perkiraan Jumlah Perceraian",
-                f"{y_pred_value:,.0f} kasus",
-            )
+            # Susun hasil dalam tabel
+            result_df = input_df[[REGION_COL, YEAR_COL]].copy()
+            result_df["Prediksi Jumlah Perceraian"] = [float(v) for v in y_pred]
+
+            st.dataframe(result_df, use_container_width=True)
+
+            # Tampilkan info ringkas
             st.caption(
-                f"Prediksi untuk **{region_input}** pada tahun **{int(year_input)}** "
-                "berdasarkan nilai faktor yang kamu atur di sebelah kiri."
+                "Catatan: faktor yang kamu pilih di-set ke **nilai median** dari dataset, "
+                "sedangkan faktor yang tidak dipilih di-set ke **0**."
             )
-        else:
-            st.info("Isi input di sebelah kiri lalu klik tombol **Prediksi** untuk melihat hasil.")
+    else:
+        st.info(
+            "Atur input di form, lalu klik tombol **Prediksi Jumlah Perceraian** "
+            "untuk melihat hasil."
+        )
+
+
 
 
 # ====== TAB 4: TABEL DATA ======
@@ -291,14 +385,21 @@ with tab4:
             options=["(Semua)"] + [str(y) for y in years],
         )
 
-    df_table = df.copy()
+        df_table = df.copy()
     if region_filter != "(Semua)":
         df_table = df_table[df_table[REGION_COL] == region_filter]
     if year_filter != "(Semua)":
         df_table = df_table[df_table[YEAR_COL] == int(year_filter)]
 
+    # Urutkan dulu
+    df_display = df_table.sort_values([YEAR_COL, REGION_COL]).reset_index(drop=True)
+
+    # Buat index jadi 1,2,3,... dan beri nama kolom "No"
+    df_display.index = df_display.index + 1
+    df_display.index.name = "No"
+
     st.dataframe(
-        df_table.sort_values([YEAR_COL, REGION_COL]),
+        df_display,
         use_container_width=True,
     )
 
