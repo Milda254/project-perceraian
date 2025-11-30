@@ -120,77 +120,94 @@ tab1, tab2, tab3, tab4 = st.tabs(
 with tab1:
     st.subheader(f"📈 Analisis Tahun {selected_year}")
 
-    col1, col2 = st.columns(2)
+    # --- GRAFIK DAERAH DENGAN ANGKA PERCERAIAN TERTINGGI (BAR HORIZONTAL) ---
+    st.markdown("#### 🔥 Daerah dengan Angka Perceraian Tertinggi")
 
-    # --- Grafik daerah dengan angka perceraian tertinggi ---
-    with col1:
-        st.markdown("#### 🔥 Daerah dengan Angka Perceraian Tertinggi")
+    df_year = df[df[YEAR_COL] == selected_year].copy()
 
-        df_year = df[df[YEAR_COL] == selected_year].copy()
-        df_year_sorted = df_year.sort_values(TARGET_COL, ascending=False)
+    # sort ascending supaya bar paling atas adalah yang terbesar (saat horizontal)
+    df_year_sorted = df_year.sort_values(TARGET_COL, ascending=True)
 
-        fig_region = px.bar(
-            df_year_sorted,
-            x=REGION_COL,
-            y=TARGET_COL,
-            title=f"Jumlah Perceraian per Kabupaten/Kota ({selected_year})",
-            labels={REGION_COL: "Kabupaten/Kota", TARGET_COL: "Jumlah Perceraian"},
+    fig_region = px.bar(
+        df_year_sorted,
+        x=TARGET_COL,          # nilai di sumbu X
+        y=REGION_COL,          # nama kab/kota di sumbu Y
+        orientation="h",       # bar horizontal
+        title=f"Jumlah Perceraian per Kabupaten/Kota ({selected_year})",
+        labels={REGION_COL: "Kabupaten/Kota", TARGET_COL: "Jumlah Perceraian"},
+    )
+
+    # supaya urutan mengikuti nilai (dari kecil ke besar)
+    fig_region.update_layout(
+        yaxis=dict(categoryorder="total ascending"),
+        height=700,  # tinggi grafik, bisa kamu sesuaikan
+        margin=dict(l=120, r=40, t=60, b=40),  # beri ruang di kiri untuk label panjang
+    )
+
+    st.plotly_chart(fig_region, use_container_width=True)
+
+    if not df_year_sorted.empty:
+        top_row = df_year_sorted.iloc[-1]  # bar terakhir = nilai tertinggi
+        st.info(
+            f"📌 **Tertinggi**: {top_row[REGION_COL]} "
+            f"dengan **{int(top_row[TARGET_COL]):,} kasus** di {selected_year}."
         )
-        fig_region.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig_region, use_container_width=True)
 
-        if not df_year_sorted.empty:
-            top_row = df_year_sorted.iloc[0]
+    st.markdown("---")
+
+    # --- GRAFIK FAKTOR TERTINGGI (JUGA DIBAWAH & HORIZONTAL) ---
+    st.markdown("#### 🧩 Faktor-faktor Tertinggi")
+
+    if factor_cols:
+        df_year = df[df[YEAR_COL] == selected_year].copy()
+
+        factor_sum = df_year[factor_cols].sum().sort_values(ascending=False)
+        factor_df = factor_sum.reset_index()
+        factor_df.columns = ["Faktor", "Nilai"]
+
+        # 1) Hilangkan prefix "Fakor Perceraian - " dari semua nama
+        factor_df["Faktor"] = (
+            factor_df["Faktor"]
+            .astype(str)
+            .str.replace("Fakor Perceraian - ", "", regex=False)
+            .str.strip()
+        )
+
+        # 2) Beberapa nama kita singkat lagi
+        short_map = {
+            "Perselisihan dan Pertengkaran Terus Menerus": "Perselisihan / Pertengkaran",
+            "Kekerasan Dalam Rumah Tangga": "KDRT",
+        }
+        factor_df["Faktor"] = factor_df["Faktor"].replace(short_map)
+
+        # sort ascending untuk bar horizontal
+        factor_df = factor_df.sort_values("Nilai", ascending=True)
+
+        fig_factor = px.bar(
+            factor_df,
+            x="Nilai",
+            y="Faktor",
+            orientation="h",
+            title=f"Kontribusi Faktor-faktor Perceraian di Tahun {selected_year}",
+            labels={"Nilai": "Total Nilai Faktor", "Faktor": "Faktor"},
+        )
+        fig_factor.update_layout(
+            yaxis=dict(categoryorder="total ascending"),
+            height=600,
+            margin=dict(l=150, r=40, t=60, b=40),
+        )
+
+        st.plotly_chart(fig_factor, use_container_width=True)
+
+        if len(factor_df) > 0:
+            top_factor = factor_df.iloc[-1]
             st.info(
-                f"📌 **Tertinggi**: {top_row[REGION_COL]} "
-                f"dengan **{int(top_row[TARGET_COL]):,} kasus** di {selected_year}."
+                f"📌 **Faktor paling dominan** di {selected_year}: "
+                f"**{top_factor['Faktor']}** (total {top_factor['Nilai']:.0f})."
             )
+    else:
+        st.warning("Tidak ada kolom faktor yang terdeteksi di dataset.")
 
-    # --- Grafik faktor tertinggi ---
-    with col2:
-        st.markdown("#### 🧩 Faktor-faktor Tertinggi")
-
-        if factor_cols:
-            df_year = df[df[YEAR_COL] == selected_year].copy()
-
-            factor_sum = df_year[factor_cols].sum().sort_values(ascending=False)
-            factor_df = factor_sum.reset_index()
-            factor_df.columns = ["Faktor", "Nilai"]
-
-            # 1) Hilangkan prefix "Fakor Perceraian - " dari semua nama
-            factor_df["Faktor"] = (
-                factor_df["Faktor"]
-                .astype(str)
-                .str.replace("Fakor Perceraian - ", "", regex=False)
-                .str.strip()
-            )
-
-            # 2) Beberapa nama kita singkat lagi
-            short_map = {
-                "Perselisihan dan Pertengkaran Terus Menerus": "Perselisihan / Pertengkaran",
-                "Kekerasan Dalam Rumah Tangga": "KDRT",
-            }
-
-            factor_df["Faktor"] = factor_df["Faktor"].replace(short_map)
-
-            fig_factor = px.bar(
-                factor_df,
-                x="Faktor",
-                y="Nilai",
-                title=f"Kontribusi Faktor-faktor Perceraian di Tahun {selected_year}",
-                labels={"Nilai": "Total Nilai Faktor"},
-            )
-            fig_factor.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig_factor, use_container_width=True)
-
-            if len(factor_df) > 0:
-                top_factor = factor_df.iloc[0]
-                st.info(
-                    f"📌 **Faktor paling dominan** di {selected_year}: "
-                    f"**{top_factor['Faktor']}** (total {top_factor['Nilai']:.0f})."
-                )
-        else:
-            st.warning("Tidak ada kolom faktor yang terdeteksi di dataset.")
 
 
 
