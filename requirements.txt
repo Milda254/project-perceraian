@@ -1,7 +1,6 @@
-streamlit
-pandas
-numpy
-scikit-learn
-tensorflow-cpu==2.20.0
-plotly
-joblib
+streamlit>=1.30
+pandas>=2.0
+numpy>=1.26
+scikit-learn>=1.4
+plotly>=5.0
+joblib>=1.3
