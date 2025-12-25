@@ -4,145 +4,191 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
-
-from tensorflow.keras.models import load_model
 import plotly.express as px
 
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.neural_network import MLPRegressor
 
 
 # =========================
-# KONFIGURASI PATH
+# 1) BUSINESS UNDERSTANDING (CRISP-DM)
+# =========================
+# Tujuan: memprediksi jumlah perceraian di kabupaten/kota Jawa Barat
+# dan membandingkan performa 2 algoritma: MLP vs RandomForest.
+
+
+# =========================
+# 2) DATA UNDERSTANDING (CRISP-DM)
 # =========================
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
-MODELS_DIR = BASE_DIR / "models"
-REPORTS_DIR = BASE_DIR / "reports"  # opsional
-
 DATA_FILE = DATA_DIR / "Dataset Jumlah Perceraian Kabupaten Kota Jawa Barat.csv"
-GEOJSON_FILE = DATA_DIR / "Kabupaten-Kota (Provinsi Jawa Barat).geojson"
+
+GEOJSON_FILE = DATA_DIR / "Kabupaten-Kota (Provinsi Jawa Barat).geojson"  # jika ada peta
 
 TARGET_COL = "Jumlah"
 YEAR_COL = "Tahun"
 REGION_COL = "Kabupaten/Kota"
 
-MLP_MODEL_FILE = "model_mlp.h5"  # sudah kamu pastikan namanya ini
 
-
-# =========================
-# UTIL
-# =========================
-def pretty_factor_name(col: str) -> str:
-    name = col.replace("Fakor Perceraian - ", "").strip()
-    if name == "Perselisihan dan Pertengkaran Terus Menerus":
-        name = "Perselisihan / Pertengkaran"
-    elif name == "Kekerasan Dalam Rumah Tangga":
-        name = "KDRT"
-    return name
-
-
-# =========================
-# LOAD DATA
-# =========================
 @st.cache_data
 def load_data() -> pd.DataFrame:
-    return pd.read_csv(DATA_FILE)
+    df = pd.read_csv(DATA_FILE)
+    return df
 
 
 @st.cache_data
 def load_geojson():
+    if not GEOJSON_FILE.exists():
+        return None
     with open(GEOJSON_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-# =========================
-# PREPROCESSOR (dibangun ulang di app, bukan joblib)
-# =========================
-@st.cache_resource
-def build_preprocessor(df: pd.DataFrame):
-    feature_cols = [c for c in df.columns if c != TARGET_COL]
+def detect_columns(df: pd.DataFrame):
+    all_cols = df.columns.tolist()
+    feature_cols = [c for c in all_cols if c != TARGET_COL]
+
     categorical_cols = [REGION_COL]
     numeric_cols = [c for c in feature_cols if c not in categorical_cols]
 
+    factor_cols = [c for c in numeric_cols if c != YEAR_COL]  # semua numeric selain tahun
+    return feature_cols, categorical_cols, numeric_cols, factor_cols
+
+
+# =========================
+# 3) DATA PREPARATION (CRISP-DM)
+# =========================
+def make_preprocessor(categorical_cols, numeric_cols):
     preprocessor = ColumnTransformer(
         transformers=[
             ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_cols),
             ("num", StandardScaler(), numeric_cols),
-        ]
+        ],
+        remainder="drop"
     )
-    preprocessor.fit(df[feature_cols])
-    return preprocessor, feature_cols, numeric_cols
+    return preprocessor
 
 
 # =========================
-# LOAD MODEL MLP
-# =========================
-@st.cache_resource
-def load_mlp():
-    model_path = MODELS_DIR / MLP_MODEL_FILE
-    return load_model(model_path, compile=False)
-
-
-# =========================
-# TRAIN RANDOM FOREST DI APP (paling aman untuk Python 3.13)
+# 4) MODELING (CRISP-DM)
 # =========================
 @st.cache_resource
-def train_random_forest(df: pd.DataFrame, preprocessor, feature_cols):
-    X = df[feature_cols]
-    y = df[TARGET_COL]
+def train_models(df: pd.DataFrame):
+    """
+    Train 2 model pipeline (MLPRegressor & RandomForestRegressor).
+    Dibuat sebagai Pipeline agar preprocessor nempel di model dan aman di Streamlit Cloud.
+    """
+    feature_cols, categorical_cols, numeric_cols, _ = detect_columns(df)
 
-    X_p = preprocessor.transform(X)
-    if hasattr(X_p, "toarray"):
-        X_p = X_p.toarray()
+    X = df[feature_cols].copy()
+    y = df[TARGET_COL].astype(float).copy()
 
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    preprocessor = make_preprocessor(categorical_cols, numeric_cols)
+
+    # Model A: MLP (sklearn)
+    mlp = MLPRegressor(
+        hidden_layer_sizes=(64, 32),
+        activation="relu",
+        solver="adam",
+        max_iter=1000,
+        random_state=42,
+    )
+    mlp_pipe = Pipeline([
+        ("prep", preprocessor),
+        ("model", mlp),
+    ])
+
+    # Model B: RandomForest
     rf = RandomForestRegressor(
-        n_estimators=500,
+        n_estimators=300,
         random_state=42,
         n_jobs=-1
     )
-    rf.fit(X_p, y)
-    return rf
+    rf_pipe = Pipeline([
+        ("prep", preprocessor),
+        ("model", rf),
+    ])
+
+    # Fit
+    mlp_pipe.fit(X_train, y_train)
+    rf_pipe.fit(X_train, y_train)
+
+    # Evaluate
+    pred_mlp = mlp_pipe.predict(X_test)
+    pred_rf = rf_pipe.predict(X_test)
+
+    metrics = {
+        "MLP": {
+            "MAE": float(mean_absolute_error(y_test, pred_mlp)),
+            "RMSE": float(mean_squared_error(y_test, pred_mlp, squared=False)),
+        },
+        "RandomForest": {
+            "MAE": float(mean_absolute_error(y_test, pred_rf)),
+            "RMSE": float(mean_squared_error(y_test, pred_rf, squared=False)),
+        },
+    }
+
+    # return semua yang dibutuhkan app
+    return {
+        "feature_cols": feature_cols,
+        "metrics": metrics,
+        "mlp_pipe": mlp_pipe,
+        "rf_pipe": rf_pipe,
+        "test_set": (X_test, y_test, pred_mlp, pred_rf),
+    }
 
 
 # =========================
-# UI
+# 5) EVALUATION (CRISP-DM) + DEPLOYMENT UI
 # =========================
-st.set_page_config(page_title="Prediksi Perceraian Provinsi Jawa Barat", layout="wide")
+st.set_page_config(page_title="Prediksi Perceraian Jawa Barat (MLP vs RF)", layout="wide")
 st.title("📊 Prediksi Perceraian Provinsi Jawa Barat")
 st.caption("Prediksi jumlah perceraian per kabupaten/kota di Provinsi Jawa Barat (MLP vs RandomForest)")
 
-# Load semua
 df = load_data()
-preprocessor, feature_cols, numeric_cols = build_preprocessor(df)
-mlp_model = load_mlp()
-rf_model = train_random_forest(df, preprocessor, feature_cols)
+geojson = load_geojson()
+
+feature_cols, categorical_cols, numeric_cols, factor_cols = detect_columns(df)
+bundle = train_models(df)
+
+mlp_pipe = bundle["mlp_pipe"]
+rf_pipe = bundle["rf_pipe"]
+metrics = bundle["metrics"]
 
 years = sorted(df[YEAR_COL].unique())
 regions = sorted(df[REGION_COL].unique())
 
-# faktor = semua numeric kecuali Tahun
-factor_cols = [c for c in numeric_cols if c != YEAR_COL]
-
 # Sidebar
-st.sidebar.header("⚙️ Filter Global")
+st.sidebar.header("⚙️ Pengaturan")
 selected_year = st.sidebar.selectbox("Pilih Tahun Analisis", options=years, index=len(years) - 1)
 st.sidebar.markdown("---")
-st.sidebar.write("Filter ini mempengaruhi grafik di tab *Eksplorasi* dan *Peta*.")
-
-# Tabs
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📈 Eksplorasi Daerah & Faktor", "🗺️ Peta Jawa Barat", "🤖 Prediksi Jumlah Perceraian", "📑 Tabel Data"]
+model_choice = st.sidebar.radio(
+    "Model untuk Prediksi",
+    options=["MLP", "RandomForest", "Rata-rata (MLP + RF)"],
+    index=0
 )
 
-# =========================
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📈 Eksplorasi", "🗺️ Peta", "🤖 Prediksi", "📊 Perbandingan Model"]
+)
+
+# -------------------------
 # TAB 1: Eksplorasi
-# =========================
+# -------------------------
 with tab1:
     st.subheader(f"📈 Analisis Tahun {selected_year}")
 
-    st.markdown("#### 🔥 Daerah dengan Angka Perceraian Tertinggi")
     df_year = df[df[YEAR_COL] == selected_year].copy()
     df_year_sorted = df_year.sort_values(TARGET_COL, ascending=True)
 
@@ -164,19 +210,16 @@ with tab1:
     if not df_year_sorted.empty:
         top_row = df_year_sorted.iloc[-1]
         st.info(
-            f"📌 **Tertinggi**: {top_row[REGION_COL]} "
-            f"dengan **{int(top_row[TARGET_COL]):,} kasus** di {selected_year}."
+            f"📌 **Tertinggi**: {top_row[REGION_COL]} dengan **{int(top_row[TARGET_COL]):,} kasus** di {selected_year}."
         )
 
     st.markdown("---")
-    st.markdown("#### 🧩 Faktor-faktor Tertinggi")
 
+    st.markdown("#### 🧩 Faktor-faktor Tertinggi")
     if factor_cols:
         factor_sum = df_year[factor_cols].sum().sort_values(ascending=False)
         factor_df = factor_sum.reset_index()
         factor_df.columns = ["Faktor", "Nilai"]
-
-        factor_df["Faktor"] = factor_df["Faktor"].astype(str).apply(pretty_factor_name)
         factor_df = factor_df.sort_values("Nilai", ascending=True)
 
         fig_factor = px.bar(
@@ -184,200 +227,140 @@ with tab1:
             x="Nilai",
             y="Faktor",
             orientation="h",
-            title=f"Kontribusi Faktor-faktor Perceraian di Tahun {selected_year}",
+            title=f"Total Faktor Penyebab Perceraian di Tahun {selected_year}",
             labels={"Nilai": "Total Nilai Faktor", "Faktor": "Faktor"},
         )
-        fig_factor.update_layout(
-            yaxis=dict(categoryorder="total ascending"),
-            height=600,
-            margin=dict(l=150, r=40, t=60, b=40),
-        )
+        fig_factor.update_layout(height=600, margin=dict(l=150, r=40, t=60, b=40))
         st.plotly_chart(fig_factor, use_container_width=True)
-
-        if len(factor_df) > 0:
-            top_factor = factor_df.iloc[-1]
-            st.info(
-                f"📌 **Faktor paling dominan** di {selected_year}: "
-                f"**{top_factor['Faktor']}**."
-            )
     else:
         st.warning("Tidak ada kolom faktor yang terdeteksi di dataset.")
 
-
-# =========================
+# -------------------------
 # TAB 2: Peta
-# =========================
+# -------------------------
 with tab2:
     st.subheader(f"🗺️ Peta Persebaran Perceraian Jawa Barat – {selected_year}")
 
-    try:
-        geojson = load_geojson()
+    if geojson is None:
+        st.info("GeoJSON belum ada. (Kalau mau peta, taruh file geojson di folder data/)")
+    else:
         df_year = df[df[YEAR_COL] == selected_year].copy()
 
         fig_map = px.choropleth(
             df_year,
             geojson=geojson,
             locations=REGION_COL,
-            featureidkey="properties.NAME_2",  # sesuaikan kalau field geojson berbeda
+            featureidkey="properties.NAME_2",  # sesuaikan jika beda
             color=TARGET_COL,
-            color_continuous_scale="Reds",
             hover_name=REGION_COL,
             hover_data={YEAR_COL: True, TARGET_COL: True},
-            labels={TARGET_COL: "Jumlah Perceraian"},
-            title=f"Peta Sebaran Perceraian per Kabupaten/Kota di Jawa Barat ({selected_year})",
+            title=f"Peta Sebaran Perceraian Jawa Barat ({selected_year})",
         )
         fig_map.update_geos(fitbounds="locations", visible=False)
         fig_map.update_layout(margin={"r": 0, "t": 50, "l": 0, "b": 0})
-
         st.plotly_chart(fig_map, use_container_width=True)
 
-        if not df_year.empty:
-            max_row = df_year.loc[df_year[TARGET_COL].idxmax()]
-            min_row = df_year.loc[df_year[TARGET_COL].idxmin()]
-            st.success(
-                f"✅ **Ringkasan {selected_year}**  \n"
-                f"- Tertinggi: **{max_row[REGION_COL]}** – {int(max_row[TARGET_COL]):,} kasus  \n"
-                f"- Terendah: **{min_row[REGION_COL]}** – {int(min_row[TARGET_COL]):,} kasus"
-            )
-    except FileNotFoundError:
-        st.error(
-            "File GeoJSON belum ditemukan.\n\n"
-            "Tambahkan file GeoJSON ke folder `data/` dan sesuaikan `featureidkey`."
-        )
-
-
-# =========================
-# TAB 3: Prediksi (MLP vs RF)
-# =========================
+# -------------------------
+# TAB 3: Prediksi
+# -------------------------
 with tab3:
-    st.subheader("🤖 Prediksi Jumlah Perceraian (MLP vs RandomForest)")
+    st.subheader("🤖 Prediksi Jumlah Perceraian")
 
     st.markdown(
-        "Pilih **kabupaten/kota**, **tahun prediksi**, dan **alasan perceraian**.\n\n"
-        "Kamu bisa memilih model **MLP** atau **RandomForest** untuk menghasilkan prediksi."
+        "Pilih **kabupaten/kota**, **tahun prediksi**, dan (opsional) atur nilai faktor. "
+        "Aplikasi akan memberi prediksi berdasarkan model yang kamu pilih di sidebar."
     )
 
-    # Pilih algoritma untuk prediksi live
-    model_name = st.selectbox("Pilih Algoritma", ["RandomForest", "MLP"])
+    with st.form("pred_form"):
+        col1, col2 = st.columns(2)
 
-    # (Opsional) tampilkan metrik perbandingan dari file hasil evaluasi training
-    metrics_path = REPORTS_DIR / "metrics_mlp_vs_rf.csv"
-    if metrics_path.exists():
-        st.subheader("📊 Perbandingan Performa (dari hasil evaluasi training)")
-        mdf = pd.read_csv(metrics_path)
-        st.dataframe(mdf, use_container_width=True)
+        with col1:
+            region_in = st.multiselect("Kabupaten/Kota", options=regions, default=[regions[0]] if regions else [])
+            year_in = st.multiselect("Tahun Prediksi", options=list(range(int(min(years)), 2101)), default=[int(max(years)) + 1])
 
-        if {"Model", "MAE"}.issubset(mdf.columns):
-            st.plotly_chart(px.bar(mdf, x="Model", y="MAE", title="Perbandingan MAE"), use_container_width=True)
-        if {"Model", "RMSE"}.issubset(mdf.columns):
-            st.plotly_chart(px.bar(mdf, x="Model", y="RMSE", title="Perbandingan RMSE"), use_container_width=True)
-    else:
-        st.info("Tambahkan `reports/metrics_mlp_vs_rf.csv` untuk menampilkan perbandingan MAE/RMSE di aplikasi.")
+        with col2:
+            st.markdown("##### Atur Nilai Faktor (opsional)")
+            st.caption("Kalau tidak diubah, default = median dataset untuk masing-masing faktor.")
+            factor_values = {}
+            for fc in factor_cols[:8]:
+                factor_values[fc] = st.number_input(fc, value=float(df[fc].median()))
 
-    # Label faktor cantik
-    factor_display_map = {col: pretty_factor_name(col) for col in factor_cols}
-    display_to_col = {v: k for k, v in factor_display_map.items()}
-    factor_options_display = [factor_display_map[c] for c in factor_cols]
+            use_zero_for_unset = st.checkbox("Faktor lain yang tidak tampil → 0", value=False)
 
-    with st.form("prediction_form"):
-        col_left, col_right = st.columns([1.4, 1])
-
-        with col_left:
-            st.markdown("##### Input Kondisi yang Ingin Diprediksi")
-
-            regions_input = st.multiselect(
-                "Pilih Kabupaten/Kota",
-                options=regions,
-                default=[regions[0]] if regions else [],
-            )
-
-            min_year = int(df[YEAR_COL].min())
-            default_year = int(df[YEAR_COL].max()) + 1
-
-            years_input = st.multiselect(
-                "Pilih Tahun Prediksi",
-                options=list(range(min_year, 2101)),
-                default=[default_year],
-            )
-
-            st.markdown("###### Alasan Perceraian")
-            st.caption(
-                "Faktor yang dipilih di-set ke **median dataset**, faktor yang tidak dipilih di-set ke **0**."
-            )
-
-            selected_factor_labels = st.multiselect(
-                "Pilih Alasan Perceraian (bisa lebih dari satu)",
-                options=factor_options_display,
-            )
-
-        with col_right:
-            st.markdown("##### Hasil Prediksi")
-            st.caption("Klik tombol untuk menghitung prediksi.")
-            submit = st.form_submit_button("🔮 Prediksi Jumlah Perceraian")
+        submit = st.form_submit_button("🔮 Prediksi")
 
     if submit:
-        if not regions_input or not years_input:
-            st.warning("Pilih **minimal satu** kabupaten/kota dan **minimal satu** tahun terlebih dahulu.")
+        if not region_in or not year_in:
+            st.warning("Pilih minimal 1 kabupaten/kota dan 1 tahun.")
         else:
-            selected_factor_cols = [display_to_col[lbl] for lbl in selected_factor_labels]
-
             rows = []
-            for region in regions_input:
-                for year in years_input:
-                    row = {REGION_COL: region, YEAR_COL: year}
-
-                    for col in factor_cols:
-                        row[col] = float(df[col].median()) if col in selected_factor_cols else 0.0
-
+            for r in region_in:
+                for y in year_in:
+                    row = {REGION_COL: r, YEAR_COL: y}
+                    for fc in factor_cols:
+                        if fc in factor_values:
+                            row[fc] = float(factor_values[fc])
+                        else:
+                            row[fc] = 0.0 if use_zero_for_unset else float(df[fc].median())
                     rows.append(row)
 
             input_df = pd.DataFrame(rows)[feature_cols]
 
-            # Transform input
-            X_p = preprocessor.transform(input_df)
-            if hasattr(X_p, "toarray"):
-                X_p = X_p.toarray()
+            pred_mlp = mlp_pipe.predict(input_df)
+            pred_rf = rf_pipe.predict(input_df)
 
-            # Predict sesuai pilihan model
-            if model_name == "MLP":
-                y_pred = mlp_model.predict(X_p).flatten()
+            if model_choice == "MLP":
+                pred_final = pred_mlp
+            elif model_choice == "RandomForest":
+                pred_final = pred_rf
             else:
-                y_pred = rf_model.predict(X_p).flatten()
+                pred_final = (pred_mlp + pred_rf) / 2.0
 
-            result_df = input_df[[REGION_COL, YEAR_COL]].copy()
-            result_df["Prediksi Jumlah Perceraian"] = [float(v) for v in y_pred]
+            out = input_df[[REGION_COL, YEAR_COL]].copy()
+            out["Prediksi (MLP)"] = pred_mlp.astype(float)
+            out["Prediksi (RF)"] = pred_rf.astype(float)
+            out["Prediksi (Dipakai)"] = pred_final.astype(float)
 
-            st.dataframe(result_df, use_container_width=True)
-    else:
-        st.info("Atur input di form, lalu klik **Prediksi Jumlah Perceraian**.")
+            st.dataframe(out, use_container_width=True)
 
-
-# =========================
-# TAB 4: Tabel Data
-# =========================
+# -------------------------
+# TAB 4: Perbandingan Model
+# -------------------------
 with tab4:
-    st.subheader("📑 Tabel Data Perceraian")
+    st.subheader("📊 Perbandingan Kinerja Model (Test Split 80/20)")
 
-    st.markdown(
-        "Tabel ini berisi data perceraian per faktor per wilayah seperti dataset asli, "
-        "bisa difilter per kabupaten/kota dan tahun."
-    )
+    met_df = pd.DataFrame([
+        {"Model": "MLP", "MAE": metrics["MLP"]["MAE"], "RMSE": metrics["MLP"]["RMSE"]},
+        {"Model": "RandomForest", "MAE": metrics["RandomForest"]["MAE"], "RMSE": metrics["RandomForest"]["RMSE"]},
+    ])
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        region_filter = st.selectbox("Filter Kabupaten/Kota (opsional)", options=["(Semua)"] + regions)
-    with col_b:
-        year_filter = st.selectbox("Filter Tahun (opsional)", options=["(Semua)"] + [str(y) for y in years])
+    c1, c2 = st.columns(2)
+    with c1:
+        fig_mae = px.bar(met_df, x="Model", y="MAE", title="Perbandingan MAE (lebih kecil lebih baik)")
+        st.plotly_chart(fig_mae, use_container_width=True)
 
-    df_table = df.copy()
-    if region_filter != "(Semua)":
-        df_table = df_table[df_table[REGION_COL] == region_filter]
-    if year_filter != "(Semua)":
-        df_table = df_table[df_table[YEAR_COL] == int(year_filter)]
+    with c2:
+        fig_rmse = px.bar(met_df, x="Model", y="RMSE", title="Perbandingan RMSE (lebih kecil lebih baik)")
+        st.plotly_chart(fig_rmse, use_container_width=True)
 
-    df_display = df_table.sort_values([YEAR_COL, REGION_COL]).reset_index(drop=True)
-    df_display.index = df_display.index + 1
-    df_display.index.name = "No"
+    X_test, y_test, pred_mlp, pred_rf = bundle["test_set"]
+    comp = pd.DataFrame({
+        "Aktual": y_test.values,
+        "Prediksi MLP": pred_mlp,
+        "Prediksi RF": pred_rf,
+    })
 
-    st.dataframe(df_display, use_container_width=True)
-    st.caption("Kamu bisa scroll, sort kolom, dan download dari menu pojok kanan atas tabel.")
+    st.markdown("#### 📌 Scatter Aktual vs Prediksi")
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        fig_sc_mlp = px.scatter(comp, x="Aktual", y="Prediksi MLP", title="Aktual vs Prediksi (MLP)")
+        st.plotly_chart(fig_sc_mlp, use_container_width=True)
+
+    with sc2:
+        fig_sc_rf = px.scatter(comp, x="Aktual", y="Prediksi RF", title="Aktual vs Prediksi (RandomForest)")
+        st.plotly_chart(fig_sc_rf, use_container_width=True)
+
+    # Kesimpulan otomatis
+    best_by_mae = met_df.sort_values("MAE").iloc[0]["Model"]
+    best_by_rmse = met_df.sort_values("RMSE").iloc[0]["Model"]
+    st.success(f"✅ Model terbaik berdasarkan MAE: **{best_by_mae}** | berdasarkan RMSE: **{best_by_rmse}**")
